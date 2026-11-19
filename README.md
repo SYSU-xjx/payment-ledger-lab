@@ -1,136 +1,136 @@
-# Payment Ledger Lab：账户转账与对账系统
+# Payment Ledger Lab: Account Transfers and Reconciliation
 
-[English](README.en.md)
+[简体中文](README.zh.md)
 
-## 当前进度与运行
+## Current Status and Local Run
 
-目前只有可启动的 Spring Boot 工程和 PostgreSQL/Kafka 本地配置；转账、账本、消息消费及对账仍是下文的实施计划。
+The repository currently contains a runnable Spring Boot application and local PostgreSQL/Kafka configuration. Transfers, the ledger, message consumption, and reconciliation are planned below but have not been implemented.
 
-需要 Java 17、Maven 和运行中的 Docker。进入本目录后执行：
+Requires Java 17, Maven, and a running Docker daemon. From this directory, run:
 
 ```sh
 docker compose up -d --wait
 SPRING_PROFILES_ACTIVE=local mvn spring-boot:run
 ```
 
-另开终端访问 `http://localhost:8080/actuator/health` 检查服务。结束时执行 `docker compose down`；PostgreSQL 数据卷会保留。`local` 配置中的密码仅用于本机演示；其他环境需提供 `DB_URL`、`DB_USER`、`DB_PASSWORD` 和 `KAFKA_BOOTSTRAP_SERVERS` 环境变量。Flyway 已接入，首个业务表迁移将在实现账户功能时添加。
+Check `http://localhost:8080/actuator/health` in another terminal. Run `docker compose down` to stop the dependencies; the PostgreSQL volume is retained. The password in the `local` profile is only for local development. Other environments must provide `DB_URL`, `DB_USER`, `DB_PASSWORD`, and `KAFKA_BOOTSTRAP_SERVERS`. Flyway is configured; the first business-table migration will be added with the account feature.
 
-## 项目提案
+## Proposal
 
-一个用于学习和求职展示的模拟支付后端。项目从零搭建，重点证明三件事：并发转账（包括换汇）不会造成余额错误；请求和消息重试不会重复产生业务效果；每笔资金变动都能由账本追溯并通过日终对账检查。
+A simulated payment backend for learning and job applications. It is intended to demonstrate three properties: concurrent transfers, including FX, cannot corrupt balances; retried requests and messages cannot duplicate business effects; and every movement of funds can be traced through the ledger and checked by end-of-day reconciliation.
 
-项目不连接真实银行或支付网络，不处理真实客户资料或资金。
+The project does not connect to a real bank or payment network and does not handle real customer data or money.
 
-## 项目目标与边界
+## Goals and Scope
 
-**核心流程**：创建零余额账户 → 使用仅限开发环境的初始化数据准备余额 → 跨币种转账前获取外汇报价 → 提交账户间转账 → 查询余额与流水 → Kafka 异步生成通知 → 执行日终对账并查看差异。
+**Core flow:** Create zero-balance accounts → prepare balances with development-only seed data → obtain an FX quote for a cross-currency transfer → submit a transfer → inspect balances and ledger entries → create an asynchronous notification through Kafka → run end-of-day reconciliation and inspect discrepancies.
 
-本项目模拟**同一系统内、允许不同币种的账户间转账和外汇兑换**。首版支持 HKD、USD、JPY，汇率来自预置的模拟数据，不接入真实行情。跨行清算、FPS 接入、外部换汇执行、汇率点差与手续费、贷款、KYC/AML 决策和真实短信/邮件发送不在首版范围内。日终对账首先检查本系统的账户余额快照、账本和转账记录是否一致；它不声称完成了与外部清算机构的对账。
+The project simulates **transfers and FX conversion between accounts in one system**. The first release supports HKD, USD, and JPY, using preconfigured demonstration rates rather than live market data. Interbank settlement, FPS integration, external FX execution, spreads and fees, loans, KYC/AML decisions, and real email/SMS delivery are out of scope. Reconciliation initially checks this system's balance snapshots, ledger, and transfer records; it does not claim to reconcile with an external clearing institution.
 
-### 必须满足的业务规则
+### Required Business Rules
 
-1. 每个账户只有一种币种。金额使用该币种的整数最小货币单位存储，例如 HKD 1.00 为 `100`、JPY 1 为 `1`；只接受正金额及不同账户的转账。
-2. 同币种转账无需报价。跨币种转账先获取限时、一次性外汇报价，报价绑定来源账户、目标账户和转出金额，并固定正数汇率及到账金额。汇率表示「1 个来源币种主单位可兑换多少目标币种主单位」。过期或已使用的报价不能用于新转账；相同幂等请求的重试仍返回原结果。
-3. 报价用 `BigDecimal` 计算目标币种金额，按目标币种最小单位以 `HALF_EVEN` 舍入一次；舍入后为零的报价无效。成功转账记录实际使用的报价、汇率、转出及到账金额，后续汇率变化不能改变已成交金额。
-4. 一笔成功转账在**同一个数据库事务**中完成扣款、入款、不可变账本分录、转账状态、报价使用状态及 Outbox 事件写入。同币种转账有两条分录；跨币种转账通过系统内部的外汇头寸账户产生四条分录，**每种币种分别相加为零**，不跨币种直接相加。
-5. 普通账户余额不得为负；系统外汇头寸账户可为负，表示模拟头寸。每个账户的余额快照必须等于该账户同币种账本分录的累计金额。
-6. 转账请求带 `Idempotency-Key`。同一调用方用同一键和相同请求重试时返回同一结果；同一键对应不同请求时拒绝。
-7. 失败转账不得留下部分扣款或账本分录，也不能消耗报价。通知失败不得撤销已成功的转账。
-8. 账本分录只追加，不修改或删除；重要操作保留时间、关联交易与审计信息。
+1. Each account holds one currency. Amounts are stored as integers in that currency's smallest unit: HKD 1.00 is `100`, while JPY 1 is `1`. Transfers require a positive amount and two distinct accounts.
+2. Same-currency transfers need no quote. A cross-currency transfer requires a time-limited, single-use FX quote tied to the source account, destination account, and source amount. The quote fixes a positive rate and destination amount. The rate means "target-currency major units per one source-currency major unit." An expired or used quote cannot fund a new transfer; an identical idempotent retry still returns its original result.
+3. Calculate the destination amount with `BigDecimal`, rounding once to the target currency's smallest unit using `HALF_EVEN`. Reject a quote whose rounded destination amount is zero. A successful transfer records its quote, rate, source amount, and destination amount; later rate changes cannot alter the booked amounts.
+4. A successful transfer commits the debit, credit, immutable ledger entries, transfer status, quote usage state, and Outbox event in **one database transaction**. Same-currency transfers have two entries. Cross-currency transfers use internal FX position accounts and have four entries; entries must sum to zero **within each currency**, never across currencies.
+5. Customer accounts cannot have negative balances. Internal FX position accounts may be negative to represent simulated positions. Each account balance snapshot must equal the sum of that account's ledger entries in its own currency.
+6. Transfer requests include an `Idempotency-Key`. The same caller retrying the same request with the same key receives the same result; reusing the key for a different request is rejected.
+7. A failed transfer leaves no partial debit or ledger entries and does not consume its quote. A failed notification does not reverse a completed transfer.
+8. Ledger entries are append-only. Important operations retain timestamps, related transaction IDs, and audit information.
 
-例如 HKD 100.00 按 `1 HKD = 0.13 USD` 换汇到账 USD 13.00：用户 HKD 账户记 `-10000`，系统 HKD 头寸账户记 `+10000`；系统 USD 头寸账户记 `-1300`，用户 USD 账户记 `+1300`。HKD 和 USD 各自平衡，不能把 `10000` 与 `1300` 直接相加。
+For example, converting HKD 100.00 at `1 HKD = 0.13 USD` credits USD 13.00: the customer HKD account records `-10000`, the internal HKD position account `+10000`, the internal USD position account `-1300`, and the customer USD account `+1300`. HKD and USD each balance independently; `10000` and `1300` must not be added together.
 
-## 建议技术栈
+## Proposed Stack
 
-| 用途 | 选择 | 学习重点 |
+| Purpose | Choice | Learning focus |
 | --- | --- | --- |
-| 后端 | Java 17、Spring Boot、Maven | 从零搭建、分层、参数校验、异常处理 |
-| 数据 | PostgreSQL、Flyway | 事务、行锁、唯一约束、迁移 |
-| 消息 | Kafka、Spring for Apache Kafka | Outbox、至少一次投递、重复消费、重试与死信 |
-| 本地运行 | Docker Compose | 一条命令启动依赖与服务 |
-| 测试 | JUnit 5、Spring Boot Test、Testcontainers | 真实 PostgreSQL/Kafka 上的并发与故障测试 |
+| Backend | Java 17, Spring Boot, Maven | Project setup, layering, validation, error handling |
+| Data | PostgreSQL, Flyway | Transactions, row locks, unique constraints, migrations |
+| Messaging | Kafka, Spring for Apache Kafka | Outbox, at-least-once delivery, duplicate consumption, retries, dead letters |
+| Local runtime | Docker Compose | Start local dependencies consistently |
+| Tests | JUnit 5, Spring Boot Test, Testcontainers | Concurrency and failure tests against real PostgreSQL/Kafka |
 
-首版保持一个 Spring Boot 应用，按转账、账本、消息和对账划分代码。Kafka 承载转账完成后的通知事件；**资金入账不依赖 Kafka 消费成功**。Redis、Kubernetes 和微服务拆分暂不加入，因为当前核心目标可以在单应用中完整验证。
+The first release remains one Spring Boot application, organized around transfers, ledger, messaging, and reconciliation. Kafka carries events after funds have been booked; **booking funds does not depend on successful Kafka consumption**. Redis, Kubernetes, and splitting into microservices are deferred because they are unnecessary to validate the core behavior.
 
-### 为什么选择 PostgreSQL
+### Why PostgreSQL?
 
-MySQL 也能用事务、行锁和唯一约束完成本项目，资金正确性不取决于数据库品牌。这里选择 PostgreSQL，是因为 `CHECK` 约束、部分索引（如只索引未发布的 Outbox 事件）以及 `INSERT ... ON CONFLICT ... RETURNING` 能直接表达本项目的数据规则和幂等写入，便于学习和验证。若目标团队使用 MySQL，可保留业务设计，但需调整 SQL 并重新验证事务隔离与并发测试。
+MySQL can also implement this project using transactions, row locks, and unique constraints; correctness does not come from the database brand. PostgreSQL was chosen because `CHECK` constraints, partial indexes (such as an index over unpublished Outbox events), and `INSERT ... ON CONFLICT ... RETURNING` express this project's data rules and idempotent writes directly. If a target team uses MySQL, the business design can remain, but the SQL and concurrency behavior under its transaction isolation settings must be tested again.
 
-## 系统设计
+## System Design
 
 ```text
-客户端 ──HTTP──> Spring Boot API ──事务──> PostgreSQL
-                         │                  ├─ accounts / fx_quotes / transfers / ledger_entries
-                         │                  └─ outbox_events
-                         └─ Outbox 发布器 ──> Kafka ──> 通知消费者 ──> notifications
+Client --HTTP--> Spring Boot API --transaction--> PostgreSQL
+                      |                             |-- accounts / fx_quotes / transfers / ledger_entries
+                      |                             `-- outbox_events
+                      `-- Outbox publisher --> Kafka --> Notification consumer --> notifications
 
-日终对账任务 ──> 比较 accounts、transfers、ledger_entries ──> 差异报告
+End-of-day reconciliation --> compare accounts, transfers, ledger_entries --> discrepancy report
 ```
 
-### 核心数据
+### Core Data
 
-- `accounts`：账户、币种、可用余额快照、状态及普通/系统账户类型。新账户余额为零。
-- `fx_quotes`：来源及目标账户、转出及到账金额、汇率、有效期和使用状态；由预置模拟汇率生成。
-- `transfers`：转账双方、各自币种与金额、报价引用、状态、调用方、幂等键、请求摘要及时间。
-- `ledger_entries`：所属账务交易（开户或转账）、账户、币种及带正负号的金额；同币种转账两条，跨币种转账四条。
-- `outbox_events`：与转账一起提交的待发布事件及发布状态。
-- `processed_events`、`notifications`：消费者去重记录及模拟通知结果。
-- `reconciliation_runs`：对账时间、结果和发现的差异。
+- `accounts`: Account, currency, balance snapshot, status, and customer/system type. New accounts start at zero.
+- `fx_quotes`: Source and destination accounts, source and destination amounts, rate, expiry, and usage state; generated from preconfigured demonstration rates.
+- `transfers`: Both accounts, currencies and amounts, quote reference, status, caller, idempotency key, request hash, and timestamps.
+- `ledger_entries`: Accounting transaction (opening or transfer), account, currency, and signed amount; two for a same-currency transfer, four for a cross-currency transfer.
+- `outbox_events`: Events committed with transfers and their publishing state.
+- `processed_events` and `notifications`: Consumer deduplication and simulated notification results.
+- `reconciliation_runs`: Run date, result, and discrepancies.
 
-开发数据通过专用初始化脚本准备：每种币种的系统测试账户与普通账户之间生成平衡的开户分录，不直接改写余额。该脚本不能用于生产环境。
+A development-only seed script creates balanced opening entries between system test accounts and customer accounts in each currency; it never changes balances without ledger entries. It must not be used in production.
 
-### 并发与幂等
+### Concurrency and Idempotency
 
-跨币种转账先锁定报价并检查有效期与未使用状态，再按账户 ID 固定顺序锁定所有涉及的用户和系统账户行；同币种转账只需按账户 ID 锁定双方账户。检查转出余额后更新账户与账本，避免并发超支、报价重复使用并降低死锁风险。数据库唯一约束保护“调用方 + 幂等键”；应用同时比较请求摘要，处理相同请求重试和键冲突。并发正确性由集成测试验证，不以单线程演示代替。
+For a cross-currency transfer, lock and validate the quote first, then lock all involved customer and system account rows in a consistent account-ID order. A same-currency transfer only locks its two accounts in account-ID order. Check available source funds before updating balances and ledger entries. This prevents concurrent overspending and quote reuse while reducing deadlock risk. A database unique constraint protects the caller/idempotency-key pair; the application compares the request hash to distinguish an identical retry from a conflict. Integration tests must prove concurrency behavior.
 
-### 消息可靠性
+### Message Reliability
 
-Outbox 发布器在事务提交后发送事件，收到 Kafka 确认再标记已发布。发送成功但标记前宕机会造成重复投递，因此通知消费者按事件 ID 去重，做到**业务效果幂等**，不假设端到端“恰好一次”。暂时性错误重试；达到重试上限的事件进入死信队列并可人工排查。通知只写入模拟通知记录，不发送真实消息。
+The Outbox publisher sends events after the transaction commits and marks them published only after Kafka acknowledges them. A crash between those steps may produce a duplicate, so the notification consumer deduplicates by event ID: the **business effect is idempotent**, without assuming end-to-end exactly-once delivery. Transient failures are retried; events exceeding the retry limit go to a dead-letter topic for investigation. Notifications are stored as simulated records; no real messages are sent.
 
-### 日终对账
+### End-of-Day Reconciliation
 
-在日终执行时检查当前账务状态：每笔成功转账按同币种两条、跨币种四条分录记账，且**每种币种分别平衡**；跨币种转出及到账金额与成交报价一致；失败转账没有入账分录；各账户余额快照与同币种账本累计金额一致。报告列出缺失分录、币种内不平衡、报价金额不符和余额差异，并保留本次检查的业务日期及结果。首版不支持按历史日期重新计算余额；独立外部流水文件对账可作为后续扩展。
+At the end of the day, inspect current accounting state: each successful transfer must have two same-currency or four cross-currency entries, balanced **per currency**; the source and destination amounts of an FX transfer must match its booked quote; failed transfers have no booked entries; each account balance snapshot must match the sum of its own-currency ledger entries. Retain the business date and result of each run, including missing entries, per-currency imbalances, quote/amount mismatches, and balance discrepancies. Historical balance reconstruction and reconciliation against an independent external statement are later extensions.
 
-## 首版 API 草案
+## Initial API Draft
 
-| 方法与路径 | 功能 |
+| Method and path | Purpose |
 | --- | --- |
-| `POST /accounts` | 创建零余额账户 |
-| `GET /accounts/{id}` | 查询账户和余额 |
-| `GET /accounts/{id}/ledger` | 分页查询账本流水 |
-| `POST /fx/quotes` | 为跨币种转账创建限时报价，返回到账金额、汇率和报价 ID |
-| `POST /transfers` | 发起同币种或跨币种转账；请求头包含 `Idempotency-Key`，跨币种时提供报价 ID |
-| `GET /transfers/{id}` | 查询转账结果 |
-| `POST /reconciliations` | 管理员触发当前账务状态对账 |
-| `GET /reconciliations/{id}` | 查看对账报告 |
+| `POST /accounts` | Create a zero-balance account |
+| `GET /accounts/{id}` | Read account and balance |
+| `GET /accounts/{id}/ledger` | Page through ledger entries |
+| `POST /fx/quotes` | Create a time-limited quote for a cross-currency transfer; return rate, destination amount, and quote ID |
+| `POST /transfers` | Submit a same-currency or cross-currency transfer; include `Idempotency-Key` and, for FX, a quote ID |
+| `GET /transfers/{id}` | Read transfer result |
+| `POST /reconciliations` | Let an administrator reconcile current accounting state |
+| `GET /reconciliations/{id}` | Read a reconciliation report |
 
-API 需有输入校验、明确的错误码、基本身份认证及账户访问控制；管理员接口与普通账户接口分权。日志不记录认证凭据或完整敏感资料，配置中的密钥不提交到仓库。
+The API needs input validation, clear error codes, basic authentication, and account-level access control. Administrator operations are separate from customer operations. Logs must omit credentials and complete sensitive data; secrets must not be committed to the repository.
 
-## 12 周交付计划
+## 12-Week Delivery Plan
 
-| 周次 | 交付物 |
+| Weeks | Deliverable |
 | --- | --- |
-| 1–2 | 从零建立 Spring Boot 项目、Docker Compose、数据库迁移、账户与初始化数据 |
-| 3–4 | 同币种转账 API、双分录账本、事务和基础集成测试 |
-| 5–6 | 外汇报价、跨币种分录、幂等键、行锁、并发和失败回滚测试 |
-| 7–8 | Kafka、Outbox 发布器、事件消费者与去重 |
-| 9–10 | 失败重试、死信处理、模拟通知与日终对账 |
-| 11–12 | 权限、审计与日志、完整测试、运行说明和项目演示 |
+| 1-2 | Spring Boot project, Docker Compose, database migrations, accounts, and seed data |
+| 3-4 | Same-currency transfer API, double-entry ledger, transactions, and basic integration tests |
+| 5-6 | FX quotes, cross-currency entries, idempotency, row locking, concurrency and rollback tests |
+| 7-8 | Kafka, Outbox publisher, event consumer, and deduplication |
+| 9-10 | Retries, dead-letter handling, simulated notifications, and end-of-day reconciliation |
+| 11-12 | Access control, audit/logging, complete tests, run instructions, and project demo |
 
-每周预留约 6 小时开发、2 小时英语技术表达、1–2 小时 Java/SQL 面试准备。英语练习围绕项目介绍、并发控制以及一次消息故障的处理展开；求职申请与项目开发并行。
+Set aside about six hours per week for development, two for technical English, and one or two for Java/SQL interview preparation. English practice should cover a project walkthrough, concurrency decisions, and a messaging failure. Job applications can run alongside development.
 
-## 完成标准
+## Acceptance Criteria
 
-- 新环境可依 README 中的启动说明运行服务和依赖，并通过测试；实现阶段补齐实际命令与 API 示例。
-- 多个并发请求争用同一账户时，余额不为负，账本与余额一致；同一幂等键并发重试只产生一笔转账。
-- HKD、USD、JPY 的同币种和跨币种转账均按各币种最小单位正确入账；测试覆盖报价过期、重复使用、舍入边界及每种币种的分录平衡。
-- Kafka 暂停或消费者重复收到事件时，已成功转账仍正确，恢复后最终只产生一次通知业务效果。
-- 对账测试能识别故意制造的缺失分录、币种内金额不平衡、报价金额不符和余额差异。
-- 仓库包含架构说明、关键设计取舍、测试运行方式与一次故障演示，便于在技术面试中解释。
+- A fresh environment can start the service and dependencies using the documented commands and pass the tests. Add actual API examples when the endpoints are implemented.
+- Concurrent requests against one source account cannot produce a negative balance; the ledger matches balances; concurrent retries with one idempotency key create one transfer.
+- Same-currency and cross-currency transfers across HKD, USD, and JPY book in each currency's smallest unit. Tests cover expired and reused quotes, rounding boundaries, and balancing within each currency.
+- A completed transfer remains correct while Kafka is unavailable or an event is redelivered; after recovery, the notification has only one business effect.
+- Reconciliation tests detect deliberately missing entries, per-currency imbalances, quote/amount mismatches, and balance discrepancies.
+- The repository explains its architecture, key tradeoffs, test commands, and one failure demonstration for technical interviews.
 
-## 学习参考
+## References
 
-- [Apache Fineract](https://github.com/apache/fineract)：参考银行业务建模与测试，不直接复制其复杂架构。
-- [Apache Kafka 文档](https://kafka.apache.org/documentation/)：理解投递、消费、分区和故障恢复。
-- [香港金管局：转数快 FPS](https://www.hkma.gov.hk/eng/smart-consumers/faster-payment-system/)：了解香港支付业务背景；本项目不接入 FPS。
-- [香港金管局：技术风险管理指引 TM-G-1](https://brdr.hkma.gov.hk/eng/doc-ldg/spm/current/TM-G-1)：了解金融系统对控制、审计和可恢复性的要求。
+- [Apache Fineract](https://github.com/apache/fineract): Banking domain modeling and tests; do not copy its large architecture.
+- [Apache Kafka documentation](https://kafka.apache.org/documentation/): Delivery, consumption, partitions, and recovery.
+- [HKMA Faster Payment System](https://www.hkma.gov.hk/eng/smart-consumers/faster-payment-system/): Hong Kong payment context; this project does not connect to FPS.
+- [HKMA Technology Risk Management guideline TM-G-1](https://brdr.hkma.gov.hk/eng/doc-ldg/spm/current/TM-G-1): Financial-system controls, auditability, and recoverability.
