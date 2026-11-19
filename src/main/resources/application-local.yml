@@ -1,0 +1,7 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/payment_ledger
+    username: payment_ledger
+    password: payment_ledger
+  kafka:
+    bootstrap-servers: localhost:9092

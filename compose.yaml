@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payment_ledger
+      POSTGRES_USER: payment_ledger
+      POSTGRES_PASSWORD: payment_ledger
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_ledger -d payment_ledger"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  kafka:
+    image: apache/kafka:3.9.1
+    ports:
+      - "127.0.0.1:9092:9092"
+
+volumes:
+  postgres_data:
